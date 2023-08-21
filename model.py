@@ -91,15 +91,83 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class RWKV_ChannelMix(nn.Module):
+    def __init__(self, args, layer_id):
+        super().__init__()
+        self.args = args
+        self.layer_id = layer_id
+        self.time_shift = nn.ZeroPad2d((0, 0, +1, -1))
+
+        with torch.no_grad():  # fancy init of time_mix
+            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, args.n_embd)
+            for i in range(args.n_embd):
+                ddd[0, 0, i] = i / args.n_embd
+            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
+            self.time_mix_r = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
+        
+        self.key = nn.Linear(args.n_embd, args.n_embd*4, bias=False)
+        self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
+        self.value = nn.Linear(args.n_embd*4, args.n_embd, bias=False)
+
+        
+
+    def forward(self, x):
+        xx = self.time_shift(x) 
+        # xk = (x).clone().sin().add(1.0).multiply(0.5) ** (self.time_shift(()).relu().add(torch.e).log() )
+        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
+        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
+        k = self.key(xk)
+        k = torch.square(torch.relu(k))
+        kv = self.value(k)
+        return torch.sigmoid(self.receptance(xr)) * kv
+    
+class HarrisonsExponentialWavenetAttention(nn.Module):
+    def __init__(self, args, layer_id):
+        super().__init__()
+
+        #this is a self imposed limit 
+        exponent = layer_id % 6
+        revexp = -layer_id % 6
+
+        self.time_shift = nn.ZeroPad2d((0, 0, 2**exponent, -(2**exponent)))
+        self.time_shift2 = nn.ZeroPad2d((0, 0, 2**revexp, -(2**revexp)))
+
+        self.qkv = nn.Linear(args.n_embd*3, args.n_embd*2, bias=False)
+        self.v = nn.Linear(args.n_embd*2, args.n_embd, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        try:
+          ts = self.time_shift(x)
+        except:
+            ts = torch.zeros_like(x)
+
+        try:
+            ts2 = self.time_shift2(x)
+        except:
+            ts2 = torch.zeros_like(x)
+        x = torch.cat([x, ts, ts2], dim=-1)
+
+        qkv = self.qkv(x)
+
+        q = qkv[:, :, :C].sigmoid()
+        k = qkv.relu().square()
+        kv = self.v(k)
+
+        return (q) * kv
+
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        # self.attn = CausalSelfAttention(config)
+        self.attn = HarrisonsExponentialWavenetAttention(config, layer_id)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
+        # self.mlp = MLP(config)
+        self.mlp = RWKV_ChannelMix(config, layer_id)
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
@@ -125,9 +193,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, _) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -155,8 +221,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        # if non_embedding:
+        #     n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -171,13 +237,16 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # x = self.transformer.drop(tok_emb + pos_emb)
+        xstack = torch.zeros_like(x)
         for block in self.transformer.h:
+            xstack = xstack*2 +x
+            x = xstack + x*2
             x = block(x)
         x = self.transformer.ln_f(x)
 
